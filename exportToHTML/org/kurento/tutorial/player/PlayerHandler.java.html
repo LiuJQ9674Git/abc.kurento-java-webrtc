@@ -1,0 +1,287 @@
+<html>
+<head>
+<title>PlayerHandler.java</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #000080; font-weight: bold;}
+.s1 { color: #000000;}
+.s2 { color: #808080; font-style: italic;}
+.s3 { color: #008000; font-weight: bold;}
+</style>
+</head>
+<body bgcolor="#ffffff">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#c0c0c0" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+PlayerHandler.java</font>
+</center></td></tr></table>
+<pre><span class="s0">package </span>org.kurento.tutorial.player;
+
+<span class="s0">import </span>java.io.IOException;
+<span class="s0">import </span>java.util.concurrent.ConcurrentHashMap;
+
+<span class="s0">import </span>org.kurento.client.EndOfStreamEvent;
+<span class="s0">import </span>org.kurento.client.ErrorEvent;
+<span class="s0">import </span>org.kurento.client.EventListener;
+<span class="s0">import </span>org.kurento.client.IceCandidate;
+<span class="s0">import </span>org.kurento.client.IceCandidateFoundEvent;
+<span class="s0">import </span>org.kurento.client.KurentoClient;
+<span class="s0">import </span>org.kurento.client.MediaPipeline;
+<span class="s0">import </span>org.kurento.client.MediaState;
+<span class="s0">import </span>org.kurento.client.MediaStateChangedEvent;
+<span class="s0">import </span>org.kurento.client.PlayerEndpoint;
+<span class="s0">import </span>org.kurento.client.VideoInfo;
+<span class="s0">import </span>org.kurento.client.WebRtcEndpoint;
+<span class="s0">import </span>org.kurento.commons.exception.KurentoException;
+<span class="s0">import </span>org.kurento.jsonrpc.JsonUtils;
+<span class="s0">import </span>org.slf4j.Logger;
+<span class="s0">import </span>org.slf4j.LoggerFactory;
+<span class="s0">import </span>org.springframework.beans.factory.annotation.Autowired;
+<span class="s0">import </span>org.springframework.web.socket.CloseStatus;
+<span class="s0">import </span>org.springframework.web.socket.TextMessage;
+<span class="s0">import </span>org.springframework.web.socket.WebSocketSession;
+<span class="s0">import </span>org.springframework.web.socket.handler.TextWebSocketHandler;
+
+<span class="s0">import </span>com.google.gson.Gson;
+<span class="s0">import </span>com.google.gson.GsonBuilder;
+<span class="s0">import </span>com.google.gson.JsonObject;
+
+<span class="s2">/**</span>
+ <span class="s2">* Protocol handler for video player through WebRTC.</span>
+ <span class="s2">*/</span>
+<span class="s0">public class </span>PlayerHandler <span class="s0">extends </span>TextWebSocketHandler {
+
+  @Autowired
+  <span class="s0">private </span>KurentoClient kurento;
+
+  <span class="s0">private final </span>Logger log = LoggerFactory.getLogger(PlayerHandler.<span class="s0">class</span>);
+  <span class="s0">private final </span>Gson gson = <span class="s0">new </span>GsonBuilder().create();
+  <span class="s0">private final </span>ConcurrentHashMap&lt;String, UserSession&gt; users = <span class="s0">new </span>ConcurrentHashMap&lt;&gt;();
+
+  @Override
+  <span class="s0">public void </span>handleTextMessage(WebSocketSession session, TextMessage message) <span class="s0">throws </span>Exception {
+    JsonObject jsonMessage = gson.fromJson(message.getPayload(), JsonObject.<span class="s0">class</span>);
+    String sessionId = session.getId();
+    log.debug(<span class="s3">&quot;Incoming message {} from sessionId&quot;</span>, jsonMessage, sessionId);
+
+    <span class="s0">try </span>{
+      <span class="s0">switch </span>(jsonMessage.get(<span class="s3">&quot;id&quot;</span>).getAsString()) {
+        <span class="s0">case </span><span class="s3">&quot;start&quot;</span>:
+          start(session, jsonMessage);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;stop&quot;</span>:
+          stop(sessionId);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;pause&quot;</span>:
+          pause(sessionId);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;resume&quot;</span>:
+          resume(session);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;doSeek&quot;</span>:
+          doSeek(session, jsonMessage);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;getPosition&quot;</span>:
+          getPosition(session);
+          <span class="s0">break</span>;
+        <span class="s0">case </span><span class="s3">&quot;onIceCandidate&quot;</span>:
+          onIceCandidate(sessionId, jsonMessage);
+          <span class="s0">break</span>;
+        <span class="s0">default</span>:
+          sendError(session, <span class="s3">&quot;Invalid message with id &quot; </span>+ jsonMessage.get(<span class="s3">&quot;id&quot;</span>).getAsString());
+          <span class="s0">break</span>;
+      }
+    } <span class="s0">catch </span>(Throwable t) {
+      log.error(<span class="s3">&quot;Exception handling message {} in sessionId {}&quot;</span>, jsonMessage, sessionId, t);
+      sendError(session, t.getMessage());
+    }
+  }
+
+  <span class="s0">private void </span>start(<span class="s0">final </span>WebSocketSession session, JsonObject jsonMessage) {
+    <span class="s2">// 1. Media pipeline</span>
+    <span class="s0">final </span>UserSession user = <span class="s0">new </span>UserSession();
+    MediaPipeline pipeline = kurento.createMediaPipeline();
+    user.setMediaPipeline(pipeline);
+    WebRtcEndpoint webRtcEndpoint = <span class="s0">new </span>WebRtcEndpoint.Builder(pipeline).build();
+    user.setWebRtcEndpoint(webRtcEndpoint);
+    String videourl = jsonMessage.get(<span class="s3">&quot;videourl&quot;</span>).getAsString();
+    <span class="s0">final </span>PlayerEndpoint playerEndpoint = <span class="s0">new </span>PlayerEndpoint.Builder(pipeline, videourl).build();
+    user.setPlayerEndpoint(playerEndpoint);
+    users.put(session.getId(), user);
+
+    playerEndpoint.connect(webRtcEndpoint);
+
+    <span class="s2">// 2. WebRtcEndpoint</span>
+    <span class="s2">// ICE candidates</span>
+    webRtcEndpoint.addIceCandidateFoundListener(<span class="s0">new </span>EventListener&lt;IceCandidateFoundEvent&gt;() {
+
+      @Override
+      <span class="s0">public void </span>onEvent(IceCandidateFoundEvent event) {
+        JsonObject response = <span class="s0">new </span>JsonObject();
+        response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;iceCandidate&quot;</span>);
+        response.add(<span class="s3">&quot;candidate&quot;</span>, JsonUtils.toJsonObject(event.getCandidate()));
+        <span class="s0">try </span>{
+          <span class="s0">synchronized </span>(session) {
+            session.sendMessage(<span class="s0">new </span>TextMessage(response.toString()));
+          }
+        } <span class="s0">catch </span>(IOException e) {
+          log.debug(e.getMessage());
+        }
+      }
+    });
+
+    String sdpOffer = jsonMessage.get(<span class="s3">&quot;sdpOffer&quot;</span>).getAsString();
+    String sdpAnswer = webRtcEndpoint.processOffer(sdpOffer);
+
+    JsonObject response = <span class="s0">new </span>JsonObject();
+    response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;startResponse&quot;</span>);
+    response.addProperty(<span class="s3">&quot;sdpAnswer&quot;</span>, sdpAnswer);
+    sendMessage(session, response.toString());
+
+    webRtcEndpoint.addMediaStateChangedListener(<span class="s0">new </span>EventListener&lt;MediaStateChangedEvent&gt;() {
+      @Override
+      <span class="s0">public void </span>onEvent(MediaStateChangedEvent event) {
+
+        <span class="s0">if </span>(event.getNewState() == MediaState.CONNECTED) {
+          VideoInfo videoInfo = playerEndpoint.getVideoInfo();
+
+          JsonObject response = <span class="s0">new </span>JsonObject();
+          response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;videoInfo&quot;</span>);
+          response.addProperty(<span class="s3">&quot;isSeekable&quot;</span>, videoInfo.getIsSeekable());
+          response.addProperty(<span class="s3">&quot;initSeekable&quot;</span>, videoInfo.getSeekableInit());
+          response.addProperty(<span class="s3">&quot;endSeekable&quot;</span>, videoInfo.getSeekableEnd());
+          response.addProperty(<span class="s3">&quot;videoDuration&quot;</span>, videoInfo.getDuration());
+          sendMessage(session, response.toString());
+        }
+      }
+    });
+
+    webRtcEndpoint.gatherCandidates();
+
+    <span class="s2">// 3. PlayEndpoint</span>
+    playerEndpoint.addErrorListener(<span class="s0">new </span>EventListener&lt;ErrorEvent&gt;() {
+      @Override
+      <span class="s0">public void </span>onEvent(ErrorEvent event) {
+        log.info(<span class="s3">&quot;ErrorEvent: {}&quot;</span>, event.getDescription());
+        sendPlayEnd(session);
+      }
+    });
+
+    playerEndpoint.addEndOfStreamListener(<span class="s0">new </span>EventListener&lt;EndOfStreamEvent&gt;() {
+      @Override
+      <span class="s0">public void </span>onEvent(EndOfStreamEvent event) {
+        log.info(<span class="s3">&quot;EndOfStreamEvent: {}&quot;</span>, event.getTimestamp());
+        sendPlayEnd(session);
+      }
+    });
+
+    playerEndpoint.play();
+  }
+
+  <span class="s0">private void </span>pause(String sessionId) {
+    UserSession user = users.get(sessionId);
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      user.getPlayerEndpoint().pause();
+    }
+  }
+
+  <span class="s0">private void </span>resume(<span class="s0">final </span>WebSocketSession session) {
+    UserSession user = users.get(session.getId());
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      user.getPlayerEndpoint().play();
+      VideoInfo videoInfo = user.getPlayerEndpoint().getVideoInfo();
+
+      JsonObject response = <span class="s0">new </span>JsonObject();
+      response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;videoInfo&quot;</span>);
+      response.addProperty(<span class="s3">&quot;isSeekable&quot;</span>, videoInfo.getIsSeekable());
+      response.addProperty(<span class="s3">&quot;initSeekable&quot;</span>, videoInfo.getSeekableInit());
+      response.addProperty(<span class="s3">&quot;endSeekable&quot;</span>, videoInfo.getSeekableEnd());
+      response.addProperty(<span class="s3">&quot;videoDuration&quot;</span>, videoInfo.getDuration());
+      sendMessage(session, response.toString());
+    }
+  }
+
+  <span class="s0">private void </span>stop(String sessionId) {
+    UserSession user = users.remove(sessionId);
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      user.release();
+    }
+  }
+
+  <span class="s0">private void </span>doSeek(<span class="s0">final </span>WebSocketSession session, JsonObject jsonMessage) {
+    UserSession user = users.get(session.getId());
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      <span class="s0">try </span>{
+        user.getPlayerEndpoint().setPosition(jsonMessage.get(<span class="s3">&quot;position&quot;</span>).getAsLong());
+      } <span class="s0">catch </span>(KurentoException e) {
+        log.debug(<span class="s3">&quot;The seek cannot be performed&quot;</span>);
+        JsonObject response = <span class="s0">new </span>JsonObject();
+        response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;seek&quot;</span>);
+        response.addProperty(<span class="s3">&quot;message&quot;</span>, <span class="s3">&quot;Seek failed&quot;</span>);
+        sendMessage(session, response.toString());
+      }
+    }
+  }
+
+  <span class="s0">private void </span>getPosition(<span class="s0">final </span>WebSocketSession session) {
+    UserSession user = users.get(session.getId());
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      <span class="s0">long </span>position = user.getPlayerEndpoint().getPosition();
+
+      JsonObject response = <span class="s0">new </span>JsonObject();
+      response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;position&quot;</span>);
+      response.addProperty(<span class="s3">&quot;position&quot;</span>, position);
+      sendMessage(session, response.toString());
+    }
+  }
+
+  <span class="s0">private void </span>onIceCandidate(String sessionId, JsonObject jsonMessage) {
+    UserSession user = users.get(sessionId);
+
+    <span class="s0">if </span>(user != <span class="s0">null</span>) {
+      JsonObject jsonCandidate = jsonMessage.get(<span class="s3">&quot;candidate&quot;</span>).getAsJsonObject();
+      IceCandidate candidate =
+          <span class="s0">new </span>IceCandidate(jsonCandidate.get(<span class="s3">&quot;candidate&quot;</span>).getAsString(), jsonCandidate
+              .get(<span class="s3">&quot;sdpMid&quot;</span>).getAsString(), jsonCandidate.get(<span class="s3">&quot;sdpMLineIndex&quot;</span>).getAsInt());
+      user.getWebRtcEndpoint().addIceCandidate(candidate);
+    }
+  }
+
+  <span class="s0">public void </span>sendPlayEnd(WebSocketSession session) {
+    <span class="s0">if </span>(users.containsKey(session.getId())) {
+      JsonObject response = <span class="s0">new </span>JsonObject();
+      response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;playEnd&quot;</span>);
+      sendMessage(session, response.toString());
+    }
+  }
+
+  <span class="s0">private void </span>sendError(WebSocketSession session, String message) {
+    <span class="s0">if </span>(users.containsKey(session.getId())) {
+      JsonObject response = <span class="s0">new </span>JsonObject();
+      response.addProperty(<span class="s3">&quot;id&quot;</span>, <span class="s3">&quot;error&quot;</span>);
+      response.addProperty(<span class="s3">&quot;message&quot;</span>, message);
+      sendMessage(session, response.toString());
+    }
+  }
+
+  <span class="s0">private synchronized void </span>sendMessage(WebSocketSession session, String message) {
+    <span class="s0">try </span>{
+      session.sendMessage(<span class="s0">new </span>TextMessage(message));
+    } <span class="s0">catch </span>(IOException e) {
+      log.error(<span class="s3">&quot;Exception sending message&quot;</span>, e);
+    }
+  }
+
+  @Override
+  <span class="s0">public void </span>afterConnectionClosed(WebSocketSession session, CloseStatus status) <span class="s0">throws </span>Exception {
+    stop(session.getId());
+  }
+}
+</pre>
+</body>
+</html>
